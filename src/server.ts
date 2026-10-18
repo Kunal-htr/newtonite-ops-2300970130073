@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import { config } from './config';
@@ -34,6 +36,22 @@ app.get('/health', (_req, res) => {
 
 app.use(authRouter);
 app.use(itemsRouter);
+
+// Production: serve the built frontend (web/dist); in dev the Vite server
+// proxies API calls instead (see web/vite.config.ts). Skipped when the build
+// is absent, so `tsx src/server.ts` during development is unaffected.
+const webDist = path.join(__dirname, '..', 'web', 'dist');
+if (fs.existsSync(webDist)) {
+  app.use(express.static(webDist));
+  // SPA fallback: any other GET (not /auth, /me, /items, /health) -> index.html.
+  app.use((req, res, next) => {
+    if (req.method === 'GET' && !/^\/(auth|me|items|health)(\/|$)/.test(req.path)) {
+      res.sendFile(path.join(webDist, 'index.html'));
+      return;
+    }
+    next();
+  });
+}
 
 // Error handler must be registered last.
 app.use(errorHandler);
