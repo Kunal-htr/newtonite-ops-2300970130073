@@ -4,6 +4,7 @@ import type { Action, CanItem } from '../authz/can';
 import type { AuthUser } from '../auth/middleware';
 import { pool, tx } from '../db/pool';
 import { denyReasonToError, HttpError, NotFound } from '../middleware/errors';
+import { enqueue } from '../outbox/enqueue';
 import { getAllowedTransitions, getTransitionRule } from './workflow';
 import type { ItemStatus } from './workflow';
 import {
@@ -274,7 +275,7 @@ export async function claimItem(user: AuthUser, itemId: string): Promise<WriteRe
       return conflictResult('NOT_CLAIMABLE', 'Item status does not allow claiming', current);
     }
 
-    await insertActivityEvent(client, {
+    const claimedEvent = await insertActivityEvent(client, {
       itemId: updated.id,
       actorId: user.id,
       type: 'CLAIMED',
@@ -289,6 +290,12 @@ export async function claimItem(user: AuthUser, itemId: string): Promise<WriteRe
         payload: { from: 'OPEN', to: updated.status },
       });
     }
+    // Outbox row in the SAME transaction: a rollback removes item change + job.
+    await enqueue(client, 'NOTIFY_ASSIGNEE', {
+      item_id: updated.id,
+      assignee_id: user.id,
+      event_id: claimedEvent.id,
+    });
     return { statusCode: 200, responseBody: toApiItem(updated) };
   });
 }
@@ -416,11 +423,17 @@ export async function assignItem(user: AuthUser, itemId: string, input: AssignIt
     });
     if (!updated) return versionConflict(client, itemId, teamIdsOf(user));
 
-    await insertActivityEvent(client, {
+    const assignedEvent = await insertActivityEvent(client, {
       itemId: updated.id,
       actorId: user.id,
       type: 'ASSIGNED',
       payload: { from: row.assignee_id, to: updated.assignee_id },
+    });
+    // Outbox row in the SAME transaction: a rollback removes item change + job.
+    await enqueue(client, 'NOTIFY_ASSIGNEE', {
+      item_id: updated.id,
+      assignee_id: input.assigneeId,
+      event_id: assignedEvent.id,
     });
     return { statusCode: 200, responseBody: toApiItem(updated) };
   });
