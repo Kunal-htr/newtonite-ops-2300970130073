@@ -3,8 +3,9 @@ FROM node:20-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
-COPY tsconfig.json ./
+COPY tsconfig*.json ./
 COPY src ./src
+COPY test ./test
 RUN npm run build
 
 # Frontend (web/): manifests first for layer caching, then sources.

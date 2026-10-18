@@ -28,7 +28,7 @@ const STATUSES = ['OPEN', 'IN_PROGRESS', 'AWAITING_APPROVAL', 'RESOLVED', 'CLOSE
 const VIEWS = ['assigned_to_me', 'unassigned_urgent', 'awaiting_my_approval'] as const;
 
 // All item routes require a Bearer token.
-itemsRouter.use(requireAuth);
+itemsRouter.use('/items', requireAuth);
 
 const uuidParam = z.uuid();
 
