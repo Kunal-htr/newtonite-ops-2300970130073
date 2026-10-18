@@ -1,14 +1,21 @@
 import express from 'express';
 import { config } from './config';
+import { authRouter } from './auth/routes';
+import { errorHandler } from './middleware/errors';
 
 export const app = express();
 
 app.use(express.json());
 
-// Liveness probe. Auth and item routes arrive in later phases.
+// Liveness probe.
 app.get('/health', (_req, res) => {
   res.status(200).json({ status: 'ok' });
 });
+
+app.use(authRouter);
+
+// Error handler must be registered last.
+app.use(errorHandler);
 
 // Only bind a port when this file is the process entry point
 // (node dist/server.js / tsx src/server.ts). Importing `app` in tests must not listen.
