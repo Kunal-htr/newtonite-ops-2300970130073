@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+*.env.local
+web/dist/
+web/node_modules/
+docs/_extracted/
+*.pdf
+*.docx
