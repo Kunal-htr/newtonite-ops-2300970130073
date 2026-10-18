@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: newtonite
+      POSTGRES_PASSWORD: newtonite
+      POSTGRES_DB: newtonite_ops
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U newtonite -d newtonite_ops"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://newtonite:newtonite@db:5432/newtonite_ops
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me}
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    # Migrations, then seed, then serve. Worker service arrives in a later phase.
+    command: sh -c "node dist/db/migrate.js && node dist/db/seed.js && node dist/server.js"
+
+volumes:
+  db_data:
