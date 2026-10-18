@@ -3,7 +3,17 @@ import { z } from 'zod';
 import { authUser, requireAuth } from '../auth/middleware';
 import { HttpError, Invalid, NotFound } from '../middleware/errors';
 import { hashRequest, requireIdempotencyKey } from '../middleware/idempotency';
-import { createItem, getItemDetail, listActivity, listItems } from './service';
+import {
+  addComment,
+  assignItem,
+  claimItem,
+  createItem,
+  getItemDetail,
+  listActivity,
+  listItems,
+  patchItem,
+  transitionItem,
+} from './service';
 
 /**
  * Item routes: parse + validate input only. No SQL here, no permission
@@ -81,6 +91,91 @@ itemsRouter.post('/items', async (req, res) => {
   if (!parsed.success) throw new Invalid('Invalid item payload');
 
   const result = await createItem(authUser(req), parsed.data, idempotencyKey, hashRequest(req.rawBody));
+  res.status(result.statusCode).json(result.responseBody);
+});
+
+/** Optimistic-concurrency token: missing, null, float or string -> 400. */
+function requireIntegerVersion(body: unknown): number {
+  const version = (body as { version?: unknown } | null | undefined)?.version;
+  if (!Number.isInteger(version)) {
+    throw new HttpError(400, 'INVALID_BODY', 'version is required and must be an integer');
+  }
+  return version as number;
+}
+
+itemsRouter.post('/items/:id/claim', async (req, res) => {
+  const id = uuidParam.safeParse(req.params.id);
+  if (!id.success) throw new NotFound('Item not found');
+
+  const result = await claimItem(authUser(req), id.data);
+  res.status(result.statusCode).json(result.responseBody);
+});
+
+const patchItemSchema = z.object({
+  title: z.string().min(1).max(200).optional(),
+  description: z.string().nullable().optional(),
+  priority: z.enum(PRIORITIES).optional(),
+  due_date: z.iso.datetime().nullable().optional(),
+});
+
+itemsRouter.patch('/items/:id', async (req, res) => {
+  const id = uuidParam.safeParse(req.params.id);
+  if (!id.success) throw new NotFound('Item not found');
+
+  const version = requireIntegerVersion(req.body); // missing/invalid -> 400
+
+  const parsed = patchItemSchema.safeParse(req.body);
+  if (!parsed.success) throw new Invalid('Invalid item payload');
+  if (Object.keys(parsed.data).length === 0) {
+    throw new HttpError(400, 'INVALID_BODY', 'At least one editable field is required');
+  }
+
+  const result = await patchItem(authUser(req), id.data, { version, fields: parsed.data });
+  res.status(result.statusCode).json(result.responseBody);
+});
+
+itemsRouter.post('/items/:id/transition', async (req, res) => {
+  const id = uuidParam.safeParse(req.params.id);
+  if (!id.success) throw new NotFound('Item not found');
+
+  const version = requireIntegerVersion(req.body);
+  const rawTo = (req.body as { to?: unknown } | null | undefined)?.to;
+  // Unknown targets fall through to the workflow lookup in the service -> 422.
+
+  const result = await transitionItem(authUser(req), id.data, {
+    to: typeof rawTo === 'string' ? rawTo : '',
+    version,
+  });
+  res.status(result.statusCode).json(result.responseBody);
+});
+
+const assignItemSchema = z.object({ assignee_id: z.uuid() });
+
+itemsRouter.post('/items/:id/assign', async (req, res) => {
+  const id = uuidParam.safeParse(req.params.id);
+  if (!id.success) throw new NotFound('Item not found');
+
+  const version = requireIntegerVersion(req.body);
+
+  const parsed = assignItemSchema.safeParse(req.body);
+  if (!parsed.success) throw new Invalid('Invalid assign payload');
+
+  const result = await assignItem(authUser(req), id.data, { assigneeId: parsed.data.assignee_id, version });
+  res.status(result.statusCode).json(result.responseBody);
+});
+
+const commentSchema = z.object({ text: z.string().min(1) });
+
+itemsRouter.post('/items/:id/comments', async (req, res) => {
+  const id = uuidParam.safeParse(req.params.id);
+  if (!id.success) throw new NotFound('Item not found');
+
+  const idempotencyKey = requireIdempotencyKey(req); // missing -> 400 MISSING_IDEMPOTENCY_KEY
+
+  const parsed = commentSchema.safeParse(req.body);
+  if (!parsed.success) throw new Invalid('Invalid comment payload');
+
+  const result = await addComment(authUser(req), id.data, parsed.data.text, idempotencyKey, hashRequest(req.rawBody));
   res.status(result.statusCode).json(result.responseBody);
 });
 

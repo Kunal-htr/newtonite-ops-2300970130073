@@ -135,15 +135,106 @@ export async function insertItem(client: PoolClient, input: NewItemInput): Promi
   return rows[0];
 }
 
+/** Unqualified column list for UPDATE ... RETURNING of a full work_items row. */
+const RETURNING_ITEM_COLUMNS = `id, title, description, type, priority, status, team_id,
+       assignee_id, created_by, due_date, version, created_at, updated_at`;
+
+/**
+ * Version/state-guarded writes: a single UPDATE whose WHERE clause decides the
+ * conflict. `undefined` means 0 rows matched (conflict or no visibility).
+ */
+export async function updateItemClaim(
+  client: PoolClient,
+  input: { id: string; userId: string }
+): Promise<WorkItemRow | undefined> {
+  const { rows } = await client.query<WorkItemRow>(
+    `UPDATE work_items
+     SET assignee_id = $2,
+         status = CASE WHEN status = 'OPEN' THEN 'IN_PROGRESS' ELSE status END,
+         version = version + 1,
+         updated_at = now()
+     WHERE id = $1 AND assignee_id IS NULL AND status IN ('OPEN', 'IN_PROGRESS')
+     RETURNING ${RETURNING_ITEM_COLUMNS}`,
+    [input.id, input.userId]
+  );
+  return rows[0];
+}
+
+export async function updateItemFields(
+  client: PoolClient,
+  input: {
+    id: string;
+    teamIds: string[];
+    version: number;
+    fields: { title?: string; description?: string | null; priority?: string; dueDate?: string | null };
+  }
+): Promise<WorkItemRow | undefined> {
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  const addParam = (value: unknown): string => `$${params.push(value)}`;
+
+  if (input.fields.title !== undefined) sets.push(`title = ${addParam(input.fields.title)}`);
+  if (input.fields.description !== undefined) sets.push(`description = ${addParam(input.fields.description)}`);
+  if (input.fields.priority !== undefined) sets.push(`priority = ${addParam(input.fields.priority)}`);
+  if (input.fields.dueDate !== undefined) sets.push(`due_date = ${addParam(input.fields.dueDate)}::timestamptz`);
+  sets.push('version = version + 1', 'updated_at = now()');
+
+  const { rows } = await client.query<WorkItemRow>(
+    `UPDATE work_items
+     SET ${sets.join(', ')}
+     WHERE id = ${addParam(input.id)} AND version = ${addParam(input.version)}
+       AND team_id = ANY(${addParam(input.teamIds)}::uuid[])
+     RETURNING ${RETURNING_ITEM_COLUMNS}`,
+    params
+  );
+  return rows[0];
+}
+
+export async function updateItemStatus(
+  client: PoolClient,
+  input: { id: string; teamIds: string[]; version: number; fromStatus: ItemStatus; toStatus: ItemStatus }
+): Promise<WorkItemRow | undefined> {
+  const { rows } = await client.query<WorkItemRow>(
+    `UPDATE work_items
+     SET status = $4, version = version + 1, updated_at = now()
+     WHERE id = $1 AND version = $2 AND status = $3 AND team_id = ANY($5::uuid[])
+     RETURNING ${RETURNING_ITEM_COLUMNS}`,
+    [input.id, input.version, input.fromStatus, input.toStatus, input.teamIds]
+  );
+  return rows[0];
+}
+
+export async function updateItemAssignee(
+  client: PoolClient,
+  input: { id: string; teamIds: string[]; version: number; assigneeId: string }
+): Promise<WorkItemRow | undefined> {
+  const { rows } = await client.query<WorkItemRow>(
+    `UPDATE work_items
+     SET assignee_id = $3, version = version + 1, updated_at = now()
+     WHERE id = $1 AND version = $2 AND team_id = ANY($4::uuid[])
+     RETURNING ${RETURNING_ITEM_COLUMNS}`,
+    [input.id, input.version, input.assigneeId, input.teamIds]
+  );
+  return rows[0];
+}
+
+/** Membership check used to validate a new assignee before the guarded UPDATE. */
+export async function hasTeamMembership(db: Db, userId: string, teamId: string): Promise<boolean> {
+  const { rows } = await db.query(`SELECT 1 FROM memberships WHERE user_id = $1 AND team_id = $2`, [userId, teamId]);
+  return rows.length > 0;
+}
+
 export async function insertActivityEvent(
   client: PoolClient,
   input: { itemId: string; actorId: string; type: string; payload: unknown }
-): Promise<void> {
-  await client.query(
+): Promise<ActivityRow> {
+  const { rows } = await client.query<ActivityRow>(
     `INSERT INTO activity_events (item_id, actor_id, type, payload)
-     VALUES ($1, $2, $3, $4::jsonb)`,
+     VALUES ($1, $2, $3, $4::jsonb)
+     RETURNING id, item_id, actor_id, type, payload, created_at`,
     [input.itemId, input.actorId, input.type, JSON.stringify(input.payload)]
   );
+  return rows[0];
 }
 
 export interface ActivityRow {

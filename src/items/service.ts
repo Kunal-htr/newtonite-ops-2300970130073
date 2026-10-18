@@ -1,19 +1,25 @@
+import type { PoolClient } from 'pg';
 import { can } from '../authz/can';
 import type { Action, CanItem } from '../authz/can';
 import type { AuthUser } from '../auth/middleware';
 import { pool, tx } from '../db/pool';
 import { denyReasonToError, HttpError, NotFound } from '../middleware/errors';
-import { TRANSITIONS } from './workflow';
+import { getAllowedTransitions, getTransitionRule } from './workflow';
 import type { ItemStatus } from './workflow';
 import {
   completeIdempotencyKey,
   getItemById,
   getIdempotencyKey,
+  hasTeamMembership,
   insertActivityEvent,
   insertIdempotencyKey,
   insertItem,
   listActivityEvents,
   listItems as listItemsInDb,
+  updateItemAssignee,
+  updateItemClaim,
+  updateItemFields,
+  updateItemStatus,
 } from './repository';
 import type { ActivityRow, ItemView, WorkItemRow } from './repository';
 
@@ -133,8 +139,8 @@ function computeAllowedActions(user: AuthUser, row: WorkItemRow): Action[] {
   const item = itemContext(row);
   return ALLOWED_ACTIONS.filter((action) => {
     if (action === 'transition') {
-      return TRANSITIONS.some(
-        (rule) => rule.from === row.status && can(user, 'transition', { ...item, targetStatus: rule.to }).allowed
+      return getAllowedTransitions(row.status).some(
+        (rule) => can(user, 'transition', { ...item, targetStatus: rule.to }).allowed
       );
     }
     return can(user, action, item).allowed;
@@ -223,6 +229,239 @@ function isIdempotencyKeyConflict(err: unknown): boolean {
   if (typeof err !== 'object' || err === null) return false;
   const pgError = err as { code?: unknown; table?: unknown };
   return pgError.code === '23505' && pgError.table === 'idempotency_keys';
+}
+
+// ---- Writes: claim / patch / transition / assign / comment -----------------
+//
+// Concurrency contract: each state change is ONE guarded UPDATE whose WHERE
+// clause decides the conflict; a 0-row result is resolved to 409/404 after it.
+// No read-then-write outside the guarded statement.
+
+/** Result a write route sends as-is; 409 bodies carry the current item. */
+export interface WriteResult {
+  statusCode: number;
+  responseBody: unknown;
+}
+
+function conflictResult(code: string, message: string, row: WorkItemRow): WriteResult {
+  return {
+    statusCode: 409,
+    responseBody: { error: { code, message }, item: toApiItem(row) },
+  };
+}
+
+/** A guarded UPDATE matched 0 rows: 404 if the item is not in the caller's teams, else 409 + latest item. */
+async function versionConflict(client: PoolClient, itemId: string, teamIds: string[]): Promise<WriteResult> {
+  const current = await getItemById(client, itemId, teamIds);
+  if (!current) throw new NotFound('Item not found');
+  return conflictResult('VERSION_CONFLICT', 'Item was modified - reload it and retry', current);
+}
+
+export async function claimItem(user: AuthUser, itemId: string): Promise<WriteResult> {
+  return tx(async (client) => {
+    // Read first only for permission context; the claim itself is decided by the UPDATE.
+    const row = await getItemById(client, itemId, teamIdsOf(user));
+    if (!row) throw new NotFound('Item not found');
+    assertCan(user, 'claim', itemContext(row));
+
+    const updated = await updateItemClaim(client, { id: itemId, userId: user.id });
+    if (!updated) {
+      const current = await getItemById(client, itemId, teamIdsOf(user));
+      if (!current) throw new NotFound('Item not found');
+      if (current.assignee_id !== null) {
+        return conflictResult('ALREADY_CLAIMED', 'Item is already assigned', current);
+      }
+      return conflictResult('NOT_CLAIMABLE', 'Item status does not allow claiming', current);
+    }
+
+    await insertActivityEvent(client, {
+      itemId: updated.id,
+      actorId: user.id,
+      type: 'CLAIMED',
+      payload: { assigneeId: user.id },
+    });
+    // The claim also moved OPEN -> IN_PROGRESS; one event per actual change.
+    if (row.status === 'OPEN') {
+      await insertActivityEvent(client, {
+        itemId: updated.id,
+        actorId: user.id,
+        type: 'STATUS_CHANGED',
+        payload: { from: 'OPEN', to: updated.status },
+      });
+    }
+    return { statusCode: 200, responseBody: toApiItem(updated) };
+  });
+}
+
+export interface PatchItemInput {
+  version: number;
+  fields: {
+    title?: string;
+    description?: string | null;
+    priority?: 'low' | 'medium' | 'high' | 'urgent';
+    due_date?: string | null;
+  };
+}
+
+export async function patchItem(user: AuthUser, itemId: string, input: PatchItemInput): Promise<WriteResult> {
+  return tx(async (client) => {
+    const row = await getItemById(client, itemId, teamIdsOf(user));
+    if (!row) throw new NotFound('Item not found');
+    assertCan(user, 'edit', itemContext(row));
+
+    // Only provided fields whose value differs are written, and each one
+    // produces its FIELD_CHANGED event in the same transaction.
+    const fields: { title?: string; description?: string | null; priority?: string; dueDate?: string | null } = {};
+    const changes: { field: string; from: string | null; to: string | null }[] = [];
+
+    if (input.fields.title !== undefined && input.fields.title !== row.title) {
+      fields.title = input.fields.title;
+      changes.push({ field: 'title', from: row.title, to: input.fields.title });
+    }
+    if (input.fields.description !== undefined && input.fields.description !== row.description) {
+      fields.description = input.fields.description;
+      changes.push({ field: 'description', from: row.description, to: input.fields.description });
+    }
+    if (input.fields.priority !== undefined && input.fields.priority !== row.priority) {
+      fields.priority = input.fields.priority;
+      changes.push({ field: 'priority', from: row.priority, to: input.fields.priority });
+    }
+    if (input.fields.due_date !== undefined) {
+      const currentDue = row.due_date ? row.due_date.toISOString() : null;
+      const nextDue = input.fields.due_date === null ? null : new Date(input.fields.due_date).toISOString();
+      if (nextDue !== currentDue) {
+        fields.dueDate = nextDue;
+        changes.push({ field: 'due_date', from: currentDue, to: nextDue });
+      }
+    }
+
+    const updated = await updateItemFields(client, {
+      id: itemId,
+      teamIds: teamIdsOf(user),
+      version: input.version,
+      fields,
+    });
+    if (!updated) return versionConflict(client, itemId, teamIdsOf(user));
+
+    for (const change of changes) {
+      await insertActivityEvent(client, {
+        itemId: updated.id,
+        actorId: user.id,
+        type: 'FIELD_CHANGED',
+        payload: change,
+      });
+    }
+    return { statusCode: 200, responseBody: toApiItem(updated) };
+  });
+}
+
+export interface TransitionItemInput {
+  to: string;
+  version: number;
+}
+
+export async function transitionItem(user: AuthUser, itemId: string, input: TransitionItemInput): Promise<WriteResult> {
+  return tx(async (client) => {
+    const row = await getItemById(client, itemId, teamIdsOf(user));
+    if (!row) throw new NotFound('Item not found');
+
+    // Workflow rule first (422), then role/assignee/self checks in can() (403).
+    const rule = getTransitionRule(row.status, input.to as ItemStatus);
+    if (!rule) {
+      throw new HttpError(422, 'INVALID_TRANSITION', `Transition ${row.status} -> ${input.to} is not allowed`);
+    }
+    assertCan(user, 'transition', { ...itemContext(row), targetStatus: rule.to });
+
+    const updated = await updateItemStatus(client, {
+      id: itemId,
+      teamIds: teamIdsOf(user),
+      version: input.version,
+      fromStatus: row.status,
+      toStatus: rule.to,
+    });
+    if (!updated) return versionConflict(client, itemId, teamIdsOf(user));
+
+    await insertActivityEvent(client, {
+      itemId: updated.id,
+      actorId: user.id,
+      type: 'STATUS_CHANGED',
+      payload: { from: row.status, to: updated.status },
+    });
+    return { statusCode: 200, responseBody: toApiItem(updated) };
+  });
+}
+
+export interface AssignItemInput {
+  assigneeId: string;
+  version: number;
+}
+
+export async function assignItem(user: AuthUser, itemId: string, input: AssignItemInput): Promise<WriteResult> {
+  return tx(async (client) => {
+    const row = await getItemById(client, itemId, teamIdsOf(user));
+    if (!row) throw new NotFound('Item not found');
+    assertCan(user, 'reassign', itemContext(row));
+
+    // The new assignee must belong to the item's team.
+    const isMember = await hasTeamMembership(client, input.assigneeId, row.team_id);
+    if (!isMember) {
+      throw new HttpError(400, 'INVALID_ASSIGNEE', 'Assignee must be a member of the item team');
+    }
+
+    const updated = await updateItemAssignee(client, {
+      id: itemId,
+      teamIds: teamIdsOf(user),
+      version: input.version,
+      assigneeId: input.assigneeId,
+    });
+    if (!updated) return versionConflict(client, itemId, teamIdsOf(user));
+
+    await insertActivityEvent(client, {
+      itemId: updated.id,
+      actorId: user.id,
+      type: 'ASSIGNED',
+      payload: { from: row.assignee_id, to: updated.assignee_id },
+    });
+    return { statusCode: 200, responseBody: toApiItem(updated) };
+  });
+}
+
+export async function addComment(
+  user: AuthUser,
+  itemId: string,
+  text: string,
+  idempotencyKey: string,
+  requestHash: string
+): Promise<WriteResult> {
+  try {
+    return await tx(async (client) => {
+      const row = await getItemById(client, itemId, teamIdsOf(user));
+      if (!row) throw new NotFound('Item not found');
+      assertCan(user, 'comment', itemContext(row));
+
+      // Same idempotency pattern as createItem: plain INSERT, 23505 replays.
+      await insertIdempotencyKey(client, { userId: user.id, key: idempotencyKey, requestHash });
+      const event = await insertActivityEvent(client, {
+        itemId: row.id,
+        actorId: user.id,
+        type: 'COMMENTED',
+        payload: { text },
+      });
+
+      const body = toApiEvent(event);
+      await completeIdempotencyKey(client, { userId: user.id, key: idempotencyKey, statusCode: 201, responseBody: body });
+      return { statusCode: 201, responseBody: body };
+    });
+  } catch (err) {
+    // The transaction that owned the key committed first: replay its response.
+    if (!isIdempotencyKeyConflict(err)) throw err;
+    const existing = await getIdempotencyKey(pool, user.id, idempotencyKey);
+    if (!existing) throw err;
+    if (existing.request_hash !== requestHash) {
+      throw new HttpError(422, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key was already used with a different request body');
+    }
+    return { statusCode: existing.status_code, responseBody: existing.response_body };
+  }
 }
 
 // ---- Activity --------------------------------------------------------------

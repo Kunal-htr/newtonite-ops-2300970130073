@@ -70,3 +70,11 @@ export const TRANSITIONS: readonly TransitionRule[] = [
 export function getTransitionRule(from: ItemStatus, to: ItemStatus): TransitionRule | undefined {
   return TRANSITIONS.find((rule) => rule.from === from && rule.to === to);
 }
+
+/**
+ * All rules defined for a status - the "what can happen next" view used by
+ * allowedActions and the UI. Lookup only; role enforcement stays in can().
+ */
+export function getAllowedTransitions(fromStatus: ItemStatus): TransitionRule[] {
+  return TRANSITIONS.filter((rule) => rule.from === fromStatus);
+}
