@@ -35,7 +35,7 @@ type Handler = (client: PoolClient, payload: unknown) => Promise<void>;
  * NOTIFY_ASSIGNEE: exactly one notification per assignment event. The dedupe
  * key makes re-processing (reclaim or retry) a no-op for the notification.
  */
-async function notifyAssignee(client: PoolClient, payload: unknown): Promise<void> {
+export async function notifyAssignee(client: PoolClient, payload: unknown): Promise<void> {
   const { item_id, assignee_id, event_id } = payload as {
     item_id?: string;
     assignee_id?: string;
@@ -116,7 +116,7 @@ async function failJob(job: OutboxJob, err: unknown): Promise<void> {
 let stopping = false;
 
 /** Claims and runs one job. Returns false when the queue is empty. */
-async function processOne(): Promise<boolean> {
+export async function processOne(): Promise<boolean> {
   const job = await claimNextJob();
   if (!job) return false;
 
@@ -154,11 +154,17 @@ function shutdown(signal: string): void {
   console.log(`${signal} received: finishing current job, then exiting`);
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+// Only run the polling loop when this file is the process entry point
+// (node dist/worker.js). Importing the module -- e.g. from tests that call
+// processOne() directly -- must have zero side effects: no timers, no signal
+// handlers, no pool shutdown.
+if (require.main === module) {
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 
-main().catch(async (err) => {
-  console.error(err);
-  await pool.end().catch(() => undefined);
-  process.exitCode = 1;
-});
+  main().catch(async (err) => {
+    console.error(err);
+    await pool.end().catch(() => undefined);
+    process.exitCode = 1;
+  });
+}
